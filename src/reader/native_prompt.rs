@@ -110,11 +110,6 @@ pub fn try_native_left_prompt(parser: &Parser) -> Option<WString> {
     })
 }
 
-/// Whether the native prompt is active (suppresses the right prompt).
-pub fn is_native_prompt(parser: &Parser) -> bool {
-    parser.vars().get(L!("fish_native_prompt")).is_some()
-}
-
 // ---------------------------------------------------------------------------
 // prompt_pwd — zero-alloc path shortening, writes directly into output WString
 // ---------------------------------------------------------------------------

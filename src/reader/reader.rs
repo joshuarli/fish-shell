@@ -5115,6 +5115,15 @@ impl<'a> Reader<'a> {
 
     /// Execute prompt commands based on the provided arguments. The output is inserted into prompt_buff.
     fn exec_prompt(&mut self, full_prompt: bool, final_prompt: bool) {
+        // Fast path: native prompt skips all script infrastructure — no scope push,
+        // no TTY protocol toggle, no mode/title/right prompt functions, no exit check.
+        if let Some(native_left) = super::native_prompt::try_native_left_prompt(self.parser) {
+            self.left_prompt_buff = native_left;
+            self.right_prompt_buff.clear();
+            self.mode_prompt_buff.clear();
+            return;
+        }
+
         // Suppress fish_trace while in the prompt.
         let _suppress_trace = self.parser.push_scope(|s| s.suppress_fish_trace = true);
 
@@ -5140,10 +5149,7 @@ impl<'a> Reader<'a> {
             self.left_prompt_buff.clear();
             self.right_prompt_buff.clear();
 
-            // Fast path: native prompt bypasses the script interpreter entirely.
-            if let Some(native_left) = super::native_prompt::try_native_left_prompt(self.parser) {
-                self.left_prompt_buff = native_left;
-            } else if !self.conf.left_prompt_cmd.is_empty() {
+            if !self.conf.left_prompt_cmd.is_empty() {
                 // Historic compatibility hack.
                 // If the left prompt function is deleted, then use a default prompt instead of
                 // producing an error.
@@ -5159,8 +5165,7 @@ impl<'a> Reader<'a> {
                     join_strings(&self.exec_prompt_cmd(prompt_cmd, final_prompt), '\n');
             }
 
-            if !super::native_prompt::is_native_prompt(self.parser)
-                && !self.conf.right_prompt_cmd.is_empty()
+            if !self.conf.right_prompt_cmd.is_empty()
                 && (self.conf.right_prompt_cmd != RIGHT_PROMPT_FUNCTION_NAME
                     || function::exists(&self.conf.right_prompt_cmd, self.parser))
             {
