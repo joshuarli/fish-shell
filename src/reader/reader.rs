@@ -5140,7 +5140,10 @@ impl<'a> Reader<'a> {
             self.left_prompt_buff.clear();
             self.right_prompt_buff.clear();
 
-            if !self.conf.left_prompt_cmd.is_empty() {
+            // Fast path: native prompt bypasses the script interpreter entirely.
+            if let Some(native_left) = super::native_prompt::try_native_left_prompt(self.parser) {
+                self.left_prompt_buff = native_left;
+            } else if !self.conf.left_prompt_cmd.is_empty() {
                 // Historic compatibility hack.
                 // If the left prompt function is deleted, then use a default prompt instead of
                 // producing an error.
@@ -5156,8 +5159,8 @@ impl<'a> Reader<'a> {
                     join_strings(&self.exec_prompt_cmd(prompt_cmd, final_prompt), '\n');
             }
 
-            // Don't execute the right prompt if it is undefined fish_right_prompt
-            if !self.conf.right_prompt_cmd.is_empty()
+            if !super::native_prompt::is_native_prompt(self.parser)
+                && !self.conf.right_prompt_cmd.is_empty()
                 && (self.conf.right_prompt_cmd != RIGHT_PROMPT_FUNCTION_NAME
                     || function::exists(&self.conf.right_prompt_cmd, self.parser))
             {
