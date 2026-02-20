@@ -215,7 +215,7 @@ fn generate_embedded_asset() {
         // With #[include], only matching files are embedded.
         // Include everything except completions, then add selected completions.
         // excluding "functions/**", "help_sections/**", "prompts/**", "themes/**", "tools/**"
-        for dir in ["config.fish", "functions/**"] {
+        for dir in ["config.fish", "functions/**", "themes/default.theme"] {
             writeln!(f, "#[include = \"{dir}\"]").unwrap();
         }
         for name in &completions {
