@@ -1,0 +1,7 @@
+# Completions to embed in the binary (one name per line, without .fish).
+# Delete this file to embed all completions.
+cd
+docker
+fish
+ssh
+scp
