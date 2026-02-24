@@ -103,6 +103,9 @@ pub struct Pager {
     // Whether to suppress the underline on the search field text.
     pub search_field_no_underline: bool,
 
+    // Whether to suppress the progress text bar at the bottom of the pager.
+    pub suppress_progress: bool,
+
     // The filtered list of completion infos.
     completion_infos: Vec<PagerComp>,
 
@@ -274,6 +277,7 @@ impl Pager {
         // Add the progress line. It's a "more to disclose" line if necessary, or a row listing if
         // it's scrollable; otherwise ignore it.
         // We should never have one row remaining to disclose (else we would have just disclosed it)
+        if !self.suppress_progress {
         let mut progress_text = WString::new();
         assert_ne!(rendering.remaining_to_disclose, 1);
         if rendering.remaining_to_disclose > 1 {
@@ -311,6 +315,7 @@ impl Pager {
                 line,
             );
         }
+        } // !suppress_progress
 
         // Render help lines as plain text (no background color).
         for help_text in &self.help_lines {
@@ -1028,6 +1033,7 @@ impl Pager {
         self.fully_disclosed = false;
         self.search_field_shown = false;
         self.search_field_no_underline = false;
+        self.suppress_progress = false;
         self.extra_progress_text.clear();
         self.help_lines.clear();
         self.suggested_row_start = 0;

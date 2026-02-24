@@ -3590,8 +3590,8 @@ impl<'a> Reader<'a> {
                 // Update the pager data.
                 self.pager.set_search_field_shown(true);
                 self.pager.search_field_no_underline = true;
+                self.pager.suppress_progress = true;
                 self.pager.set_prefix(Cow::Borrowed(L!("")), false);
-                self.pager.set_fully_disclosed();
                 // Show pager immediately with empty results while index builds.
                 self.pager.set_completions(&[], false);
                 self.layout_and_repaint(L!("path-jump"));
