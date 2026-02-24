@@ -700,6 +700,14 @@ pub struct ReaderData {
     history_search: ReaderHistorySearch,
     /// In-pager history search.
     history_pager: Option<Range<usize>>,
+    /// Whether the path jump pager is active.
+    path_jump_active: bool,
+    /// Whether a path jump selection has been confirmed (waiting for action key).
+    path_jump_confirmed: bool,
+    /// The confirmed path from path jump.
+    path_jump_selected: WString,
+    /// Cached path index for the current ^J session. Built once, filtered per keystroke.
+    path_jump_index: Option<Arc<super::path_jump::PathIndex>>,
 
     /// The cursor selection mode.
     cursor_selection_mode: CursorSelectionMode,
@@ -783,6 +791,9 @@ impl<'a> Reader<'a> {
             self.highlight_completed(r);
         }
         if let Some(cb) = self.debouncers.history_pager.take_result() {
+            cb(self);
+        }
+        if let Some(cb) = self.debouncers.path_jump.take_result() {
             cb(self);
         }
     }
@@ -1390,6 +1401,10 @@ impl ReaderData {
             history,
             history_search: Default::default(),
             history_pager: None,
+            path_jump_active: false,
+            path_jump_confirmed: false,
+            path_jump_selected: WString::new(),
+            path_jump_index: None,
             cursor_selection_mode: CursorSelectionMode::Exclusive,
             cursor_end_mode: CursorEndMode::Exclusive,
             selection: Default::default(),
@@ -1420,7 +1435,7 @@ impl ReaderData {
     }
 
     fn is_navigating_pager_contents(&self) -> bool {
-        self.pager.is_navigating_contents() || self.history_pager.is_some()
+        self.pager.is_navigating_contents() || self.history_pager.is_some() || self.path_jump_active
     }
 
     fn edit_line(&self, elt: EditableLineTag) -> &EditableLine {
@@ -1495,6 +1510,10 @@ impl ReaderData {
                         Some(SelectionMotion::Next),
                         SearchDirection::Backward,
                     );
+                    return;
+                }
+                if self.path_jump_active {
+                    self.fill_path_jump_pager();
                     return;
                 }
                 if self.pager.is_empty() {
@@ -2850,21 +2869,34 @@ impl<'a> Reader<'a> {
                 self.run_input_command_scripts(&command);
             }
             CharEvent::Key(kevt) => {
-                // Ordinary char.
-                if kevt.input_style == CharInputStyle::NotFirst
-                    && self.active_edit_line().1.position() == 0
-                {
-                    // This character is skipped.
-                } else {
-                    // Regular character.
-                    let (elt, _el) = self.active_edit_line();
+                // Path jump confirmed mode: intercept action keys, swallow others.
+                let mut handled = false;
+                if self.path_jump_active && self.path_jump_confirmed {
+                    handled = true;
                     if let Some(c) = kevt.key.codepoint_text() {
-                        self.insert_char(elt, c);
+                        if matches!(c, 'e' | 'c' | 'l') {
+                            self.execute_path_jump_action(c);
+                        }
+                        // All other chars are swallowed in confirmed mode.
+                    }
+                }
+                if !handled {
+                    // Ordinary char.
+                    if kevt.input_style == CharInputStyle::NotFirst
+                        && self.active_edit_line().1.position() == 0
+                    {
+                        // This character is skipped.
+                    } else {
+                        // Regular character.
+                        let (elt, _el) = self.active_edit_line();
+                        if let Some(c) = kevt.key.codepoint_text() {
+                            self.insert_char(elt, c);
 
-                        if elt == EditableLineTag::Commandline {
-                            self.clear_pager();
-                            // We end history search. We could instead update the search string.
-                            self.history_search.reset();
+                            if elt == EditableLineTag::Commandline {
+                                self.clear_pager();
+                                // We end history search. We could instead update the search string.
+                                self.history_search.reset();
+                            }
                         }
                     }
                 }
@@ -3015,6 +3047,30 @@ impl<'a> Reader<'a> {
     fn handle_readline_command(&mut self, c: ReadlineCmd) {
         #[allow(non_camel_case_types)]
         type rl = ReadlineCmd;
+        // Path jump confirmed mode: Backspace returns to search, others are swallowed
+        // (except Execute which is handled in handle_execute, and Cancel).
+        if self.path_jump_confirmed {
+            match c {
+                rl::BackwardDeleteChar => {
+                    self.path_jump_confirmed = false;
+                    self.pager.help_lines.clear();
+                    // Re-filter the cached index to restore completions.
+                    if let Some(index) = &self.path_jump_index {
+                        let search_term = self.pager.search_field_line.text().to_owned();
+                        let results = super::path_jump::filter_index(index, &search_term);
+                        self.set_path_jump_completions(&results);
+                    }
+                    self.layout_and_repaint(L!("path-jump-unconfirm"));
+                    return;
+                }
+                rl::Execute => {} // fall through to handle_execute
+                rl::Cancel => {
+                    self.clear_pager();
+                    return;
+                }
+                _ => return, // swallow everything else
+            }
+        }
         match c {
             rl::BeginningOfLine => {
                 // Go to beginning of line.
@@ -3519,6 +3575,42 @@ impl<'a> Reader<'a> {
                     self.history_search.search_string().to_owned()
                 };
                 self.insert_string(EditableLineTag::SearchField, &search_string);
+            }
+            rl::PathJump => {
+                if self.path_jump_active {
+                    // Already active, do nothing.
+                    return;
+                }
+                // Record our cycle_command_line.
+                self.cycle_command_line = self.command_line.text().to_owned();
+                self.cycle_cursor_pos = self.command_line.position();
+
+                self.path_jump_active = true;
+                self.path_jump_index = None;
+                // Update the pager data.
+                self.pager.set_search_field_shown(true);
+                self.pager.search_field_no_underline = true;
+                self.pager.set_prefix(Cow::Borrowed(L!("")), false);
+                self.pager.set_fully_disclosed();
+                // Show pager immediately with empty results while index builds.
+                self.pager.set_completions(&[], false);
+                self.layout_and_repaint(L!("path-jump"));
+                // Build the index on a background thread.
+                let history = self.history.clone();
+                let performer = move || -> iothreads::Callback {
+                    let index = Arc::new(super::path_jump::build_index(&history));
+                    Box::new(move |r: &mut Reader| {
+                        if !r.path_jump_active {
+                            return;
+                        }
+                        r.path_jump_index = Some(Arc::clone(&index));
+                        let search_term = r.pager.search_field_line.text().to_owned();
+                        let results = super::path_jump::filter_index(&index, &search_term);
+                        r.set_path_jump_completions(&results);
+                        r.layout_and_repaint(L!("path-jump"));
+                    })
+                };
+                self.debouncers.path_jump.perform(performer);
             }
             #[allow(deprecated)]
             rl::HistoryDelete | rl::HistoryPagerDelete => {
@@ -4452,6 +4544,48 @@ impl<'a> Reader<'a> {
     fn handle_execute(&mut self) -> bool {
         // Evaluate. If the current command is unfinished, or if the character is escaped
         // using a backslash, insert a newline.
+        // Path jump: two-stage Enter.
+        if self.path_jump_active {
+            if self.path_jump_confirmed {
+                // Second Enter: insert the confirmed path.
+                let path = self.path_jump_selected.clone();
+                self.clear_pager();
+                let saved_cmd = self.cycle_command_line.clone();
+                let saved_pos = self.cycle_cursor_pos;
+                let cmd_len = self.command_line.len();
+                self.replace_substring(
+                    EditableLineTag::Commandline,
+                    0..cmd_len,
+                    saved_cmd,
+                );
+                self.command_line.set_position(saved_pos);
+                let formatted = super::path_jump::format_path_for_insertion(&path);
+                self.insert_string(EditableLineTag::Commandline, &formatted);
+                return true;
+            }
+            // First Enter: confirm selection, show action help.
+            if let Some(comp) = self
+                .pager
+                .selected_completion(&self.current_page_rendering)
+            {
+                self.path_jump_selected = comp.completion.clone();
+                self.path_jump_confirmed = true;
+                self.pager.set_completions(&[], false);
+                self.pager.help_lines = vec![
+                    WString::new(),
+                    WString::from_str("e to edit with $EDITOR"),
+                    WString::from_str("c to cd"),
+                    WString::from_str("l to ls"),
+                    WString::from_str("Enter to insert at cursor"),
+                    WString::from_str("Backspace to go back"),
+                ];
+                self.layout_and_repaint(L!("path-jump-confirm"));
+                return true;
+            }
+            // No selection: just close.
+            self.clear_pager();
+            return true;
+        }
         // If the user hits return while navigating the pager, it only clears the pager.
         if self.is_navigating_pager_contents() {
             let search_field = &self.data.pager.search_field_line;
@@ -4572,6 +4706,10 @@ impl ReaderData {
     fn clear_pager(&mut self) {
         self.pager.clear();
         self.history_pager = None;
+        self.path_jump_active = false;
+        self.path_jump_confirmed = false;
+        self.path_jump_selected.clear();
+        self.path_jump_index = None;
         self.clear(EditableLineTag::SearchField);
         self.command_line_transient_edit = None;
     }
@@ -4646,6 +4784,11 @@ impl ReaderData {
     /// Do what we need to do whenever our pager selection changes.
     fn pager_selection_changed(&mut self) {
         assert_is_main_thread();
+
+        // Path jump: don't overwrite the command line with the selection.
+        if self.path_jump_active {
+            return;
+        }
 
         // Update the cursor and command line.
         let mut cursor_pos = self.cycle_cursor_pos;
@@ -5919,6 +6062,22 @@ impl ReaderData {
         };
         self.debouncers.history_pager.perform(performer);
     }
+
+    /// Set path jump completions and auto-select the first result.
+    fn set_path_jump_completions(&mut self, results: &[Completion]) {
+        self.pager.set_completions(results, false);
+        self.pager.set_selected_completion_index(Some(0));
+    }
+
+    fn fill_path_jump_pager(&mut self) {
+        if let Some(index) = &self.path_jump_index {
+            // Index is built — filter synchronously, no debouncer needed.
+            let search_term = self.pager.search_field_line.text().to_owned();
+            let results = super::path_jump::filter_index(index, &search_term);
+            self.set_path_jump_completions(&results);
+        }
+        // If index is not yet built, ignore — results will arrive via the build callback.
+    }
 }
 
 impl<'a> Reader<'a> {
@@ -5958,6 +6117,44 @@ impl<'a> Reader<'a> {
         }
         self.super_highlight_me_plenty();
         self.layout_and_repaint(L!("history-pager"));
+    }
+
+    fn execute_path_jump_action(&mut self, action: char) {
+        let path = self.path_jump_selected.clone();
+        if path.is_empty() {
+            return;
+        }
+
+        // Close pager and restore command line.
+        self.clear_pager();
+        let saved_cmd = self.cycle_command_line.clone();
+        let saved_pos = self.cycle_cursor_pos;
+        let cmd_len = self.command_line.len();
+        self.replace_substring(
+            EditableLineTag::Commandline,
+            0..cmd_len,
+            saved_cmd,
+        );
+        self.command_line.set_position(saved_pos);
+
+        let formatted = super::path_jump::format_path_for_insertion(&path);
+        let cmd = match action {
+            'e' => WString::from_str("$EDITOR ") + formatted.as_utfstr(),
+            'c' => {
+                WString::from_str("cd (path dirname ")
+                    + formatted.as_utfstr()
+                    + L!(" 2>/dev/null; or echo ")
+                    + formatted.as_utfstr()
+                    + L!(")")
+            }
+            'l' => WString::from_str("ls ") + formatted.as_utfstr(),
+            _ => return,
+        };
+        let cmd_len = self.command_line.len();
+        self.replace_substring(EditableLineTag::Commandline, 0..cmd_len, cmd);
+        let new_len = self.command_line.len();
+        self.command_line.set_position(new_len);
+        self.handle_execute();
     }
 }
 
@@ -6182,6 +6379,7 @@ fn command_ends_paging(c: ReadlineCmd, focused_on_search_field: bool) -> bool {
         rl::Complete
         | rl::CompleteAndSearch
         | rl::HistoryPager
+        | rl::PathJump
         | rl::BackwardChar
         | rl::BackwardCharPassive
         | rl::ForwardChar

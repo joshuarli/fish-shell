@@ -124,7 +124,7 @@ function __fish_shared_key_bindings -d "Bindings shared between emacs and vi mod
         bind --preset $argv shift-space 'commandline -i " " '$maybe_search_field expand-abbr
 
         bind --preset $argv enter execute
-        bind --preset $argv ctrl-j execute
+        bind --preset $argv ctrl-j path-jump
         bind --preset $argv ctrl-m execute
         # Make Control+Return behave like Return because it's easy to mistype after accepting an autosuggestion.
         bind --preset $argv ctrl-enter execute

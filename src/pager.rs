@@ -100,6 +100,9 @@ pub struct Pager {
     // Whether we show the search field.
     pub search_field_shown: bool,
 
+    // Whether to suppress the underline on the search field text.
+    pub search_field_no_underline: bool,
+
     // The filtered list of completion infos.
     completion_infos: Vec<PagerComp>,
 
@@ -118,6 +121,9 @@ pub struct Pager {
 
     // Extra text to display at the bottom of the pager.
     pub extra_progress_text: WString,
+
+    // Plain text lines to display instead of completions (e.g. help text).
+    pub help_lines: Vec<WString>,
 }
 
 impl Pager {
@@ -306,6 +312,19 @@ impl Pager {
             );
         }
 
+        // Render help lines as plain text (no background color).
+        for help_text in &self.help_lines {
+            let line = rendering.screen_data.add_line();
+            print_max(
+                CharOffset::None,
+                help_text,
+                HighlightSpec::new(),
+                term_width,
+                false,
+                line,
+            );
+        }
+
         if !self.search_field_shown {
             return true;
         }
@@ -323,7 +342,9 @@ impl Pager {
 
         // We limit the width to term_width - 1.
         let mut underline = HighlightSpec::new();
-        underline.force_underline = true;
+        if !self.search_field_no_underline {
+            underline.force_underline = true;
+        }
 
         let mut search_field_remaining = term_width - 1;
         search_field_remaining -= print_max(
@@ -1006,7 +1027,9 @@ impl Pager {
         self.selected_completion_idx = None;
         self.fully_disclosed = false;
         self.search_field_shown = false;
+        self.search_field_no_underline = false;
         self.extra_progress_text.clear();
+        self.help_lines.clear();
         self.suggested_row_start = 0;
     }
 

@@ -1079,6 +1079,59 @@ impl HistoryImpl {
         let old_item_offsets = self.load_old_if_needed().offsets();
         new_item_count + old_item_offsets.len()
     }
+
+    /// Collect path entries from history items under a single lock acquisition.
+    /// Returns deduplicated (path, frequency, last_used) tuples, scanning at most `limit` items.
+    fn collect_path_entries(
+        &mut self,
+        limit: usize,
+    ) -> Vec<(WString, u32, SystemTime)> {
+        let mut path_map: HashMap<WString, (u32, SystemTime)> = HashMap::new();
+
+        let mut accumulate = |item: &HistoryItem| {
+            let paths = item.get_required_paths();
+            if !paths.is_empty() {
+                let timestamp = item.timestamp();
+                for path in paths {
+                    let entry = path_map.entry(path.clone()).or_insert((0, timestamp));
+                    entry.0 += 1;
+                    if timestamp > entry.1 {
+                        entry.1 = timestamp;
+                    }
+                }
+            }
+        };
+
+        // Determine resolved new item count (skip pending item).
+        let mut resolved_new_item_count = self.new_items.len();
+        if self.has_pending_item && resolved_new_item_count > 0 {
+            resolved_new_item_count -= 1;
+        }
+
+        // Iterate new items (most recent first).
+        let new_to_scan = resolved_new_item_count.min(limit);
+        for i in 0..new_to_scan {
+            accumulate(&self.new_items[resolved_new_item_count - i - 1]);
+        }
+
+        // Iterate old items (most recent first).
+        let remaining = limit - new_to_scan;
+        let file_contents = self.load_old_if_needed();
+        let old_item_offsets = file_contents.offsets();
+        let old_item_count = old_item_offsets.len();
+        let old_to_scan = old_item_count.min(remaining);
+        for i in 0..old_to_scan {
+            let offset = old_item_offsets[old_item_count - i - 1];
+            if let Some(item) = file_contents.decode_item(offset) {
+                accumulate(&item);
+            }
+        }
+
+        path_map
+            .into_iter()
+            .map(|(path, (freq, ts))| (path, freq, ts))
+            .collect()
+    }
 }
 
 fn string_could_be_path(potential_path: &wstr) -> bool {
@@ -1514,6 +1567,12 @@ impl History {
     pub fn size(&self) -> usize {
         self.imp().size()
     }
+
+    /// Collect path entries from history under a single lock acquisition.
+    /// Returns deduplicated (path, frequency, last_used) tuples.
+    pub fn collect_path_entries(&self, limit: usize) -> Vec<(WString, u32, SystemTime)> {
+        self.imp().collect_path_entries(limit)
+    }
 }
 
 bitflags! {
@@ -1753,8 +1812,14 @@ pub fn expand_and_detect_paths<P: IntoIterator<Item = WString>>(
             None,
         ) && path_is_valid(&expanded_path, &working_directory)
         {
-            // Note we return the original (unexpanded) path.
-            result.push(path);
+            // Store the absolute path so it's useful from any working directory.
+            if expanded_path.chars().next() != Some('/') {
+                let mut abs = working_directory.clone();
+                abs.push_utfstr(&expanded_path);
+                result.push(abs);
+            } else {
+                result.push(expanded_path);
+            }
         }
     }
 
@@ -2456,5 +2521,206 @@ mod tests {
         ];
         assert_eq!(test_history_imported_from_corrupted.get_history(), expected);
         test_history_imported_from_corrupted.clear();
+    }
+
+    // ---- collect_path_entries ----
+
+    /// Helper: add a history item with required paths and a specific timestamp.
+    fn add_item_with_paths(
+        history: &History,
+        cmd: &str,
+        paths: &[&str],
+        when: SystemTime,
+    ) {
+        let mut item = HistoryItem::new(WString::from_str(cmd), when, PersistenceMode::Memory);
+        item.set_required_paths(paths.iter().map(|p| WString::from_str(p)).collect());
+        history.add(item, false);
+    }
+
+    /// Convenience: look up a path in the collected entries.
+    fn find_entry<'a>(
+        entries: &'a [(WString, u32, SystemTime)],
+        path: &str,
+    ) -> Option<&'a (WString, u32, SystemTime)> {
+        entries.iter().find(|(p, _, _)| p == path)
+    }
+
+    #[test]
+    fn test_collect_path_entries_empty_history() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_empty"), &hist_dir);
+
+        let entries = history.collect_path_entries(10_000);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_collect_path_entries_items_without_paths() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_no_paths"), &hist_dir);
+        let now = SystemTime::now();
+
+        history.add(
+            HistoryItem::new(L!("ls").to_owned(), now, PersistenceMode::Memory),
+            false,
+        );
+        history.add(
+            HistoryItem::new(L!("echo hello").to_owned(), now, PersistenceMode::Memory),
+            false,
+        );
+
+        let entries = history.collect_path_entries(10_000);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_collect_path_entries_single_item() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_single"), &hist_dir);
+        let now = SystemTime::now();
+
+        add_item_with_paths(&history, "vim /foo/bar", &["/foo/bar"], now);
+
+        let entries = history.collect_path_entries(10_000);
+        assert_eq!(entries.len(), 1);
+        let e = find_entry(&entries, "/foo/bar").unwrap();
+        assert_eq!(e.1, 1); // frequency
+        assert_eq!(e.2, now); // timestamp
+    }
+
+    #[test]
+    fn test_collect_path_entries_deduplicates_same_path() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_dedup"), &hist_dir);
+        let now = SystemTime::now();
+
+        add_item_with_paths(&history, "vim /foo", &["/foo"], now);
+        add_item_with_paths(&history, "cat /foo", &["/foo"], now);
+        add_item_with_paths(&history, "less /foo", &["/foo"], now);
+
+        let entries = history.collect_path_entries(10_000);
+        assert_eq!(entries.len(), 1);
+        let e = find_entry(&entries, "/foo").unwrap();
+        assert_eq!(e.1, 3); // frequency accumulated
+    }
+
+    #[test]
+    fn test_collect_path_entries_keeps_latest_timestamp() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_latest_ts"), &hist_dir);
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        let new = SystemTime::now();
+
+        add_item_with_paths(&history, "vim /foo", &["/foo"], old);
+        add_item_with_paths(&history, "cat /foo", &["/foo"], new);
+
+        let entries = history.collect_path_entries(10_000);
+        let e = find_entry(&entries, "/foo").unwrap();
+        assert_eq!(e.1, 2);
+        assert_eq!(e.2, new); // most recent timestamp kept
+    }
+
+    #[test]
+    fn test_collect_path_entries_multiple_paths_per_item() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_multi_paths"), &hist_dir);
+        let now = SystemTime::now();
+
+        add_item_with_paths(&history, "diff /a /b", &["/a", "/b"], now);
+
+        let entries = history.collect_path_entries(10_000);
+        assert_eq!(entries.len(), 2);
+        assert!(find_entry(&entries, "/a").is_some());
+        assert!(find_entry(&entries, "/b").is_some());
+    }
+
+    #[test]
+    fn test_collect_path_entries_limit_caps_scan() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_limit"), &hist_dir);
+        let now = SystemTime::now();
+
+        // Add 10 items, each with a unique path.
+        for i in 0..10 {
+            let path = format!("/path/{i}");
+            add_item_with_paths(&history, &format!("vim {path}"), &[&path], now);
+        }
+
+        // With limit=10, all 10 items scanned → 10 paths.
+        let entries_all = history.collect_path_entries(10);
+        assert_eq!(entries_all.len(), 10);
+
+        // With limit=3, only the 3 most recent items scanned → 3 paths.
+        let entries_limited = history.collect_path_entries(3);
+        assert_eq!(entries_limited.len(), 3);
+    }
+
+    #[test]
+    fn test_collect_path_entries_skips_pending_item() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_pending"), &hist_dir);
+        let now = SystemTime::now();
+
+        add_item_with_paths(&history, "vim /resolved", &["/resolved"], now);
+        // Add a pending item — should be excluded.
+        let mut pending = HistoryItem::new(
+            L!("vim /pending").to_owned(),
+            now,
+            PersistenceMode::Memory,
+        );
+        pending.set_required_paths(vec![WString::from_str("/pending")]);
+        history.add(pending, true);
+
+        let entries = history.collect_path_entries(10_000);
+        assert!(
+            find_entry(&entries, "/pending").is_none(),
+            "pending item should be excluded"
+        );
+        assert!(find_entry(&entries, "/resolved").is_some());
+    }
+
+    #[test]
+    fn test_collect_path_entries_mixed_with_and_without_paths() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_mixed"), &hist_dir);
+        let now = SystemTime::now();
+
+        history.add(
+            HistoryItem::new(L!("ls").to_owned(), now, PersistenceMode::Memory),
+            false,
+        );
+        add_item_with_paths(&history, "vim /a", &["/a"], now);
+        history.add(
+            HistoryItem::new(L!("echo hi").to_owned(), now, PersistenceMode::Memory),
+            false,
+        );
+        add_item_with_paths(&history, "cat /b", &["/b"], now);
+
+        let entries = history.collect_path_entries(10_000);
+        assert_eq!(entries.len(), 2);
+        assert!(find_entry(&entries, "/a").is_some());
+        assert!(find_entry(&entries, "/b").is_some());
+    }
+
+    #[test]
+    fn test_collect_path_entries_limit_zero() {
+        let tmpdir = fish_tempfile::new_dir().unwrap();
+        let hist_dir = osstr2wcstring(tmpdir.path());
+        let history = create_test_history(L!("cpe_zero"), &hist_dir);
+        let now = SystemTime::now();
+
+        add_item_with_paths(&history, "vim /foo", &["/foo"], now);
+
+        let entries = history.collect_path_entries(0);
+        assert!(entries.is_empty());
     }
 }

@@ -26,6 +26,8 @@ pub(super) struct Debouncers {
     // Debounce history pager computations. This holds a callback, not a single value,
     // both to demonstrate the technique and because the callback can capture local variables.
     pub history_pager: Debounce<Callback>,
+    // Debounce path jump pager computations.
+    pub path_jump: Debounce<Callback>,
 }
 
 impl Debouncers {
@@ -37,10 +39,12 @@ impl Debouncers {
         const HIGHLIGHT_TIMEOUT: Duration = Duration::from_millis(500);
         const HISTORY_PAGER_TIMEOUT: Duration = Duration::from_millis(500);
         const AUTOSUGGEST_TIMEOUT: Duration = Duration::from_millis(500);
+        const PATH_JUMP_TIMEOUT: Duration = Duration::from_millis(500);
         Self {
             autosuggestions: Debounce::new(&pool, &event_signaller, AUTOSUGGEST_TIMEOUT),
             highlight: Debounce::new(&pool, &event_signaller, HIGHLIGHT_TIMEOUT),
             history_pager: Debounce::new(&pool, &event_signaller, HISTORY_PAGER_TIMEOUT),
+            path_jump: Debounce::new(&pool, &event_signaller, PATH_JUMP_TIMEOUT),
             event_signaller,
         }
     }
