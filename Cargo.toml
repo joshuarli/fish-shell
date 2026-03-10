@@ -84,8 +84,11 @@ unix_path = "1.0.1"
 xterm-color = "1.0.1"
 
 [profile.release]
-overflow-checks = true
-lto = true
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
 
 [profile.release-with-debug]
 inherits = "release"
