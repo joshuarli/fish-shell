@@ -1,6 +1,11 @@
 [workspace]
 members = ["crates/*"]
 
+[patch.crates-io]
+# shellexpand 3.1.1 uses `var_name.as_str()` which collides with the new inherent
+# `str::as_str() -> &str` in nightly Rust. Use fully-qualified trait syntax instead.
+shellexpand = { path = "vendor/shellexpand" }
+
 [workspace.package]
 # To build revisions that use Corrosion (those before 2024-01), use CMake 3.19, Rustc 1.78 and Rustup 1.27.
 rust-version = "1.85"
