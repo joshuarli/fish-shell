@@ -17,12 +17,23 @@ struct State {
     home: Option<WString>,           // wide string avoids a conversion roundtrip
     pwd_cfg: Option<(usize, usize)>, // (dir_len, full_dirs)
     // Mutable — tracks the repo we're inside:
-    git: Option<(PathBuf, PathBuf)>, // (repo_root, head_file_path)
+    git: GitCache,
     // PWD cache: re-converting WString→String on every render allocates.
     // Keep the last-seen PWD (for change detection) and its UTF-8 form
     // (for Path operations), refreshed only on directory change.
     pwd_last: WString,
     pwd_str: String,
+}
+
+enum GitCache {
+    /// Haven't looked yet.
+    Unknown,
+    /// Found a repo: skip the walk while cwd stays under `root`.
+    Repo { root: PathBuf, head: PathBuf },
+    /// Walked from `from` to `/` and found nothing. Any ancestor of `from`
+    /// was already checked, so we can skip the walk when cwd is at or above
+    /// `from`. When cwd is deeper than `from`, we only walk the new portion.
+    NoRepo { from: PathBuf },
 }
 
 struct ColorKit {
@@ -37,7 +48,7 @@ thread_local! {
         user_host: None,
         home: None,
         pwd_cfg: None,
-        git: None,
+        git: GitCache::Unknown,
         pwd_last: WString::new(),
         pwd_str: String::new(),
     });
@@ -230,37 +241,62 @@ fn prompt_pwd_into(out: &mut WString, pwd: &wstr, home: &wstr, dir_len: usize, f
 
 /// Write " branch" into `out` (with leading space) if `cwd` is inside a git repo.
 /// Returns true if a branch was written.
-/// Caches the repo root and HEAD path to avoid a directory walk on each render.
-fn git_branch_into(
-    cache: &mut Option<(PathBuf, PathBuf)>,
-    cwd: &Path,
-    out: &mut WString,
-) -> bool {
-    // Fast path: still inside the cached repo.
-    if let Some((root, head_path)) = cache.as_ref() {
-        if cwd.starts_with(root) {
-            return read_head_into(head_path, out);
+///
+/// Three-way cache:
+///   Repo  — cwd is under the cached root → read HEAD, no walk.
+///   NoRepo — we previously walked from `from` to `/` and found nothing.
+///            If cwd is an ancestor of `from`, skip entirely (zero IO).
+///            If cwd is deeper than `from`, only walk the new portion.
+///   Unknown / miss — full walk, then cache the result.
+fn git_branch_into(cache: &mut GitCache, cwd: &Path, out: &mut WString) -> bool {
+    match cache {
+        GitCache::Repo { root, head } if cwd.starts_with(&*root) => {
+            return read_head_into(head, out);
         }
+        GitCache::NoRepo { from } if from.starts_with(cwd) => {
+            // cwd is at or above where we already searched — no repo here.
+            return false;
+        }
+        GitCache::NoRepo { from } if cwd.starts_with(&*from) => {
+            // Deeper than the cached no-repo path. Only walk the new
+            // directories between cwd and `from` (use `from` as ceiling).
+            match find_git_dir(cwd, Some(&*from)) {
+                Some(git_dir) => {
+                    let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
+                    let head_path = git_dir.join("HEAD");
+                    let written = read_head_into(&head_path, out);
+                    *cache = GitCache::Repo { root, head: head_path };
+                    return written;
+                }
+                None => {
+                    // Extend coverage to the deeper path.
+                    *from = cwd.to_path_buf();
+                    return false;
+                }
+            }
+        }
+        _ => {}
     }
 
-    // Slow path: walk up to find .git, then cache.
-    match find_git_dir(cwd) {
+    // Full walk.
+    match find_git_dir(cwd, None) {
         Some(git_dir) => {
             let root = git_dir.parent().unwrap_or(cwd).to_path_buf();
             let head_path = git_dir.join("HEAD");
             let written = read_head_into(&head_path, out);
-            *cache = Some((root, head_path));
+            *cache = GitCache::Repo { root, head: head_path };
             written
         }
         None => {
-            *cache = None;
+            *cache = GitCache::NoRepo { from: cwd.to_path_buf() };
             false
         }
     }
 }
 
 /// Walk ancestors of `start` looking for `.git` (dir or worktree file).
-fn find_git_dir(start: &Path) -> Option<PathBuf> {
+/// Stops early if it reaches `ceiling` (exclusive) without finding anything.
+fn find_git_dir(start: &Path, ceiling: Option<&Path>) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
     loop {
         let dot_git = dir.join(".git");
@@ -271,6 +307,9 @@ fn find_git_dir(start: &Path) -> Option<PathBuf> {
             if meta.is_file() {
                 return resolve_gitdir_file(&dot_git);
             }
+        }
+        if ceiling.is_some_and(|c| dir == c) {
+            return None;
         }
         if !dir.pop() {
             return None;
