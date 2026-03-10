@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release
+    runs-on: macos-15
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test and build release
+        run: |
+          make test-ci
+          make build-release
+
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          V="${VERSION#release/}"
+          TARGET=$(rustc -vV | sed -n 's/^host: //p')
+          gh release create "$VERSION" \
+            "target/${TARGET}/release/fish#fish-${V}-${TARGET}" \
+            --title "$V"
