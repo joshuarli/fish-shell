@@ -36,10 +36,7 @@ pub struct Autoload {
     cache: AutoloadFileCache,
 }
 
-#[derive(RustEmbed)]
-#[folder = "share"]
-#[exclude = "__fish_build_paths.fish.in"]
-pub struct Asset;
+include!(concat!(env!("OUT_DIR"), "/embedded_asset.rs"));
 
 pub fn has_asset(cmd: &str) -> bool {
     Asset::get(cmd).is_some()

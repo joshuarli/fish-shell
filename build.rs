@@ -6,6 +6,7 @@ use rsconf::Target;
 use std::path::{Path, PathBuf};
 
 fn main() {
+    generate_embedded_asset();
     setup_paths();
 
     // Add our default to enable tools that don't go through CMake, like "cargo test" and the
@@ -185,6 +186,55 @@ fn setup_paths() {
             )
         })
     });
+}
+
+/// Generate `$OUT_DIR/embedded_asset.rs` containing the `Asset` struct derive.
+/// If `embedded_completions.txt` exists, only those completions are embedded.
+/// Otherwise all completions are embedded (the default).
+fn generate_embedded_asset() {
+    use std::io::Write;
+
+    let manifest_dir = workspace_root();
+    let list_path = manifest_dir.join("embedded_completions.txt");
+    println!("cargo:rerun-if-changed={}", list_path.display());
+
+    let out_dir = PathBuf::from(env_var("OUT_DIR").unwrap());
+    let out_path = out_dir.join("embedded_asset.rs");
+    let mut f = std::fs::File::create(&out_path).unwrap();
+
+    if list_path.exists() {
+        let contents = std::fs::read_to_string(&list_path).unwrap();
+        let completions: Vec<&str> = contents
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+
+        writeln!(f, "#[derive(RustEmbed)]").unwrap();
+        writeln!(f, "#[folder = \"share\"]").unwrap();
+        // With #[include], only matching files are embedded.
+        // Include everything except completions, then add selected completions.
+        // excluding "functions/**", "help_sections/**", "prompts/**", "themes/**", "tools/**"
+        for dir in ["config.fish", "functions/**", "themes/default.theme"] {
+            writeln!(f, "#[include = \"{dir}\"]").unwrap();
+        }
+        for name in &completions {
+            writeln!(f, "#[include = \"completions/{name}.fish\"]").unwrap();
+        }
+        writeln!(f, "pub struct Asset;").unwrap();
+
+        eprintln!(
+            "fish: embedding {} completions (from embedded_completions.txt)",
+            completions.len()
+        );
+    } else {
+        writeln!(f, "#[derive(RustEmbed)]").unwrap();
+        writeln!(f, "#[folder = \"share\"]").unwrap();
+        writeln!(f, "#[exclude = \"__fish_build_paths.fish.in\"]").unwrap();
+        writeln!(f, "pub struct Asset;").unwrap();
+
+        eprintln!("fish: embedding all completions (no embedded_completions.txt)");
+    }
 }
 
 fn get_version() -> String {
